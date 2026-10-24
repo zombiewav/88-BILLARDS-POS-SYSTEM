@@ -1,0 +1,149 @@
+import 'package:billiards_pos/data/database.dart';
+import 'package:billiards_pos/data/session_repository.dart';
+import 'package:billiards_pos/features/inventory/inventory_page.dart';
+import 'package:billiards_pos/features/sell/sell_page.dart';
+import 'package:billiards_pos/providers.dart';
+import 'package:drift/native.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  late AppDatabase db;
+
+  setUp(() => db = AppDatabase(NativeDatabase.memory()));
+
+  /// Drift runs on real async; let it finish between frames.
+  /// Database calls started by a button tap live in the test's fake-async zone,
+  /// so they only advance when frames are pumped: alternate real time and pumps.
+  Future<void> settle(WidgetTester tester) async {
+    for (var i = 0; i < 6; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 30)));
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+  }
+
+  /// pumpAndSettle never settles while a focused text field blinks its cursor.
+  Future<void> anim(WidgetTester tester) async {
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+  }
+
+  Future<void> show(WidgetTester tester, Widget page) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await tester.runAsync(db.init);
+    await tester.pumpWidget(ProviderScope(
+      overrides: [databaseProvider.overrideWithValue(db)],
+      child: MaterialApp(home: page),
+    ));
+    await settle(tester);
+  }
+
+  Future<void> finish(WidgetTester tester) async {
+    await tester.pumpWidget(const SizedBox());
+    await tester.runAsync(db.close);
+  }
+
+  Future<Product> product(WidgetTester tester, String name) async =>
+      (await tester.runAsync(
+              () => (db.select(db.products)..where((p) => p.name.equals(name))).getSingle()))!;
+
+  testWidgets('Sell: add benta to a table bill', (tester) async {
+    await tester.runAsync(db.init);
+    final table = (await tester.runAsync(() => db.select(db.poolTables).get()))!.first;
+    final sessionId = (await tester.runAsync(() => SessionRepository(db).startTimeSession(
+        tableId: table.id, minutes: 30, price: 50, now: DateTime.now())))!;
+
+    await show(tester, SellPage(attachTo: (sessionId: sessionId, tableLabel: 'T1')));
+
+    await tester.tap(find.text('Coke').first);
+    await tester.pump();
+    await tester.tap(find.text('Coke').first);
+    await tester.pump();
+    expect(find.text('Add to bill · ₱30'), findsOneWidget);
+
+    await tester.tap(find.text('Add to bill · ₱30'));
+    await settle(tester);
+
+    final session = (await tester.runAsync(
+        () => SessionRepository(db).watchSession(sessionId).first))!;
+    expect(session!.total, 80);
+    expect((await product(tester, 'Coke')).stock, 22);
+    await finish(tester);
+  });
+
+  testWidgets('Sell: walk-in sale takes cash and reduces stock', (tester) async {
+    await show(tester, const SellPage());
+
+    await tester.tap(find.text('Royal').first);
+    await tester.pump();
+    await tester.tap(find.text('Charge · ₱15'));
+    await anim(tester);
+
+    await tester.tap(find.text('Exact'));
+    await tester.pump();
+    await tester.tap(find.text('Pay ₱15'));
+    await settle(tester);
+
+    expect((await product(tester, 'Royal')).stock, 23);
+    final payments = (await tester.runAsync(() => db.select(db.payments).get()))!;
+    expect(payments.single.amount, 15);
+    expect(payments.single.saleId, isNotNull);
+    await finish(tester);
+  });
+
+  testWidgets('Sell: cannot add more than is in stock', (tester) async {
+    await show(tester, const SellPage());
+    final coke = await product(tester, 'Coke');
+
+    for (var i = 0; i < coke.stock + 3; i++) {
+      await tester.tap(find.text('Coke').first);
+      await tester.pump();
+    }
+    expect(find.text('Charge · ₱${coke.stock * 15}'), findsOneWidget);
+    await finish(tester);
+  });
+
+  testWidgets('Inventory: stock in from the list', (tester) async {
+    await show(tester, const InventoryPage());
+    expect(find.text('Coke'), findsOneWidget);
+
+    await tester.tap(find.text('Stock in').first);
+    await anim(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Quantity received'), '6');
+    await tester.pump();
+    await tester.tap(find.text('Add stock'));
+    await anim(tester);
+    await settle(tester);
+
+    final stocks = (await tester.runAsync(() => db.select(db.products).get()))!
+        .map((p) => p.stock)
+        .toList()
+      ..sort();
+    expect(stocks, [24, 24, 30]);
+    await finish(tester);
+  });
+
+  testWidgets('Inventory: add a product with opening stock', (tester) async {
+    await show(tester, const InventoryPage());
+
+    await tester.tap(find.text('Add product'));
+    await anim(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Name'), 'Sting');
+    await tester.enterText(find.widgetWithText(TextField, 'Price (₱)'), '20');
+    await tester.enterText(find.widgetWithText(TextField, 'Opening stock'), '12');
+    await tester.pump();
+    await tester.tap(find.text('Add'));
+    await anim(tester);
+    await settle(tester);
+
+    final sting = await product(tester, 'Sting');
+    expect(sting.price, 20);
+    expect(sting.stock, 12);
+    await finish(tester);
+  });
+}
+
